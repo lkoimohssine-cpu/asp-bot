@@ -1,0 +1,46 @@
+# ASP Bot — Setup Reference
+
+## Repo settings
+- Repo must be **Public** (unlimited Actions minutes on free plan)
+- Actions must be enabled: Settings → Actions → General → Allow all
+
+## Required Global Secrets
+| Name | Description |
+|------|-------------|
+| GH_PAT | GitHub Personal Access Token (repo scope) |
+| GMAIL_EMAIL | Your Gmail address |
+| GMAIL_APP_PW | Gmail App Password (16 chars, no spaces) |
+| FB_ACCOUNTS | Facebook accounts (one `email:password` per line) |
+| CONTENT | Default posts (one per line) — used if CONTENT_N not set |
+| IMAGES | Default image URLs (one per line) |
+| COMMENTS | Comments to leave in groups (one per line) |
+
+## Optional Per-Account Secrets
+- `CONTENT_1` .. `CONTENT_10` — niche-specific posts
+- `IMAGES_1` .. `IMAGES_10` — niche-specific images
+
+## Auto-Managed Secrets (do not edit manually)
+- `FB_COOKIES_1` .. `FB_COOKIES_N` — created by "Add Account (Auto)"
+
+## Setup Order
+1. Paste all 10 files into repo
+2. Make repo Public
+3. Add global secrets (7 above)
+4. Add FB_ACCOUNTS with your first accounts
+5. Actions → "Add Account (Auto)" → Run workflow (leave inputs empty)
+6. Actions → "Group Discovery" → Run workflow (populates groups.txt)
+7. Wait — Auto Poster runs on cron 15x/day
+
+## Adding More Accounts
+1. Update FB_ACCOUNTS secret (append new `email:password` lines)
+2. Actions → "Add Account (Auto)" → Run workflow (leave inputs empty)
+3. Only new accounts get processed
+
+## Updating Content
+- Just update `CONTENT` or `CONTENT_N` secret
+- Changes apply on next cron run (no re-deploy needed)
+
+## Monitoring
+- Actions tab shows all runs
+- `state/acc{N}.json` shows per-account progress
+- `groups.txt` shows discovered groups
