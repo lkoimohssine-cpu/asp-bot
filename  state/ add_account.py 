@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""Add Account (Auto) - login + save cookies for accounts in FB_ACCOUNTS."""
+import os, sys, json, re, time, imaplib, email, base64, asyncio, random
+from playwright.async_api import async_playwright
+import requests
+from nacl import encoding, public
+
+REPO = os.environ.get("GITHUB_REPOSITORY", "")
+GH_PAT = os.environ.get("GH_PAT", "")
+FB_ACCOUNTS_RAW = os.environ.get("FB_ACCOUNTS", "").strip()
+GMAIL_EMAIL = os.environ.get("GMAIL_EMAIL", "").strip()
+GMAIL_APP_PW = os.environ.get("GMAIL_APP_PW", "").strip()
+ACCOUNT_NUM = os.environ.get("ACCOUNT_NUMBER", "").strip()
+MANUAL_CODE = os.environ.get("MANUAL_CODE", "").strip()
+FORCE_ALL = os.environ.get("FORCE_ALL", "").strip().lower() in ("1", "true", "yes")
+
+def mask(s):
+    if not s or len(s) < 4: return "***"
+    if "@" in s:
+        u, d = s.split("@", 1); return u[:2] + "***@" + d
+    return s[:2] + "***" + s[-2:]
+
+def parse_accounts():
+    accounts = []
+    for line in FB_ACCOUNTS_RAW.split("\n"):
+        line = line.strip()
+        if not line or line.startswith("#") or ":" not in line: continue
+        parts = line.split(":", 1)
+        e, p = parts[0].strip(), parts[1].strip()
+        if e and p: accounts.append((e, p))
+    return accounts
+
+def gh_headers():
+    return {"Authorization": "token " + GH_PAT, "Accept": "application/vnd.github.v3+json"}
+
+def get_existing_cookies():
+    existing = set()
+    try:
+        page = 1
+        while True:
+            r = requests.get(f"https://api.github.com/repos/{REPO}/actions/secrets?per_page=100&page={page}",
+                             headers=gh_headers(), timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            secrets = data.get("secrets", [])
+            if not secrets: break
+            for s in secrets:
+                m = re.match(r'^FB_COOKIES_(\d+)$', s["name"])
+                if m: existing.add(int(m.group(1)))
+            if len(secrets) < 100: break
+            page += 1
+    except Exception as e:
+        print(f"Warning: {str(e)[:80]}")
+    return existing
+
+def get_public_key():
+    r = requests.get(f"https://api.github.com/repos/{REPO}/actions/secrets/public-key",
+                     headers=gh_headers(), timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def encrypt_secret(pk_b64, value):
+    pk = public.PublicKey(pk_b64.encode(), encoding.Base64Encoder())
+    sealed = public.SealedBox(pk)
+    return base64.b64encode(sealed.encrypt(value.encode())).decode()
+
+def upload_secret(name, value):
+    key = get_public_key()
+    enc = encrypt_secret(key["key"], value)
+    r = requests.put(f"https://api.github.com/repos/{REPO}/actions/secrets/{name}",
+                     headers=gh_headers(), json={"encrypted_value": enc, "key_id": key["key_id"]}, timeout=30)
+    r.raise_for_status()
+
+def poll_gmail(timeout=90):
+    if not GMAIL_EMAIL or not GMAIL_APP_PW:
+        print("  Gmail creds missing"); return None
+    print("  Polling Gmail...", flush=True)
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            imap = imaplib.IMAP4_SSL("imap.gmail.com")
+            imap.login(GMAIL_EMAIL, GMAIL_APP_PW)
+            imap.select("INBOX")
+            _, data = imap.search(None, '(UNSEEN FROM "facebook")')
+            ids = data[0].split()
+            if not ids:
+                _, data = imap.search(None, '(UNSEEN FROM "facebookmail.com")')
+                ids = data[0].split()
+            for num in reversed(ids):
+                _, msg_data = imap.fetch(num, "(RFC822)")
+                msg = email.message_from_bytes(msg_data[0][1])
+                body = ""
+                if msg.is_multipart():
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/plain":
+                            try: body += part.get_payload(decode=True).decode(errors="ignore")
+                            except: pass
+                else:
+                    try: body = msg.get_payload(decode=True).decode(errors="ignore")
+                    except: body = str(msg.get_payload())
+                text = msg.get("Subject", "") + " " + body
+                for m in re.findall(r'\b(\d{5,8})\b', text):
+                    if m.startswith("20") and len(m) == 4: continue
+                    print(f"  Found code: {mask(m)}", flush=True)
+                    imap.logout()
+                    return m
+            imap.logout()
+        except Exception as e:
+            print(f"  Gmail err: {str(e)[:60]}", flush=True)
+        time.sleep(5)
+    return None
+
+async def process_one(pw_obj, num, fb_email, fb_password, allow_manual):
+    br = await pw_obj.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+    try:
+        ctx = await br.new_context(
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            viewport={"width": 1366, "height": 768})
+        page = await ctx.new_page()
+        await page.goto("https://www.facebook.com/login", timeout=60000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        await page.locator('input[name="email"]').fill(fb_email)
+        await page.wait_for_timeout(1500)
+        await page.locator('input[name="pass"]').fill(fb_password)
+        await page.wait_for_timeout(1500)
+        await page.locator('button[name="login"]').click()
+        await page.wait_for_timeout(8000)
+        for _ in range(5):
+            url = page.url
+            print(f"  URL: {url[:70]}", flush=True)
+            if "checkpoint" in url or "two_step" in url or "login_alerts" in url:
+                code = MANUAL_CODE if (MANUAL_CODE and allow_manual) else poll_gmail(90)
+                if not code: raise Exception("no code obtained")
+                try:
+                    await page.locator('input[name="approvals_code"]').first.fill(code)
+                    await page.wait_for_timeout(2000)
+                    try: await page.locator('button:has-text("Continue")').first.click(timeout=8000)
+                    except: await page.locator('button[type="submit"]').first.click(timeout=8000)
+                    await page.wait_for_timeout(6000)
+                except Exception as e:
+                    raise Exception(f"code submit fail: {str(e)[:60]}")
+            try:
+                for _ in range(5):
+                    clicked = False
+                    for t in ["Continue", "This was me", "Yes"]:
+                        try:
+                            b = page.locator(f'button:has-text("{t}")').first
+                            if await b.is_visible(timeout=2000):
+                                await b.click(); await page.wait_for_timeout(4000)
+                                clicked = True; break
+                        except: pass
+                    if not clicked: break
+            except: pass
+            if "login" not in page.url and "checkpoint" not in page.url: break
+        if "login" in page.url or "checkpoint" in page.url:
+            raise Exception(f"login failed at {page.url[:60]}")
+        cookies = await ctx.cookies()
+        fb_c = [c for c in cookies if "facebook.com" in c.get("domain", "")]
+        print(f"  Got {len(fb_c)} cookies", flush=True)
+        upload_secret(f"FB_COOKIES_{num}", json.dumps(fb_c))
+        print(f"  ✅ FB_COOKIES_{num} saved", flush=True)
+    finally:
+        await br.close()
+
+async def main():
+    if not GH_PAT or not REPO:
+        print("ERROR: GH_PAT/REPO missing"); sys.exit(1)
+    if not FB_ACCOUNTS_RAW:
+        print("ERROR: FB_ACCOUNTS empty"); sys.exit(1)
+    accounts = parse_accounts()
+    if not accounts:
+        print("ERROR: no valid accounts"); sys.exit(1)
+    print(f"=== Add Account Runner ===")
+    print(f"Total in list: {len(accounts)}")
+    if ACCOUNT_NUM:
+        try:
+            idx = int(ACCOUNT_NUM) - 1
+            if idx < 0 or idx >= len(accounts):
+                print(f"ERROR: account {ACCOUNT_NUM} out of range"); sys.exit(1)
+            targets = [idx]
+        except ValueError:
+            print("ERROR: bad account_number"); sys.exit(1)
+    else:
+        existing = get_existing_cookies() if not FORCE_ALL else set()
+        print(f"Already configured: {len(existing)}")
+        targets = [i for i in range(len(accounts)) if (i + 1) not in existing]
+    if not targets:
+        print("Nothing to do ✅"); return
+    print(f"Will process {len(targets)} account(s)\n")
+    success, failed = 0, 0
+    async with async_playwright() as p:
+        for i, idx in enumerate(targets):
+            n = str(idx + 1)
+            e, pw = accounts[idx]
+            print(f"[{i+1}/{len(targets)}] Account {n}: {mask(e)}")
+            try:
+                await process_one(p, n, e, pw, allow_manual=(ACCOUNT_NUM == n))
+                success += 1
+            except Exception as ex:
+                print(f"  ❌ FAILED: {str(ex)[:120]}")
+                failed += 1
+            if i < len(targets) - 1:
+                d = random.randint(30, 90)
+                print(f"  Waiting {d}s...\n")
+                await asyncio.sleep(d)
+    print(f"\n=== SUMMARY ===")
+    print(f"Success: {success} | Failed: {failed} | Total: {len(targets)}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
